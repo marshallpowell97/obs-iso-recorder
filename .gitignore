@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Build output
+/build*/
+/release/
+/.deps/
+/.ccache/
+
+# CMake
+cmake/.CMakeBuildNumber
+CMakeUserPresets.json
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Test output
+*.mov
+*.mp4
+__pycache__/
