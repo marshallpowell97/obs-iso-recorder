@@ -39,21 +39,27 @@
 
 #define DEFAULT_FILENAME_FORMAT "%CCYY-%MM-%DD %hh-%mm-%ss"
 
-/* Resources owned by one running recording. Detached from the filter when
- * the output stops so they can be released on OBS's destroy thread without
- * touching the filter again. */
+/* Resources owned by one recording. A session is detached from its filter as
+ * soon as a stop is requested, so the filter can start a new recording while
+ * the old file is still being finalised. The session then releases itself on
+ * OBS's destroy thread once the output reports "stop". */
 struct iso_session {
 	obs_output_t *output;
 	obs_encoder_t *venc;
 	obs_encoder_t *aenc;
 	obs_view_t *view;
 	obs_weak_source_t *parent;
+
+	/* Owning filter while this is the filter's current session, NULL once
+	 * detached. Guarded by session_mutex. */
+	struct iso_filter *filter;
+	struct dstr name; /* for logging after the filter may be gone */
 };
 
 struct iso_filter {
 	obs_source_t *source;
-	pthread_mutex_t mutex;
-	struct iso_session *session;
+	pthread_mutex_t mutex; /* serialises start/stop of this filter */
+	struct iso_session *session; /* guarded by session_mutex */
 	struct dstr last_path;
 };
 
@@ -63,15 +69,22 @@ struct iso_filter {
 static pthread_mutex_t filters_mutex;
 static DARRAY(struct iso_filter *) filters;
 
+/* Guards iso_filter.session and iso_session.filter. Only ever held briefly
+ * and never while calling into OBS, so the output's stop signal can take it
+ * from any thread. Lock order: iso_filter.mutex -> session_mutex. */
+static pthread_mutex_t session_mutex;
+
 void iso_filters_init(void)
 {
 	pthread_mutex_init(&filters_mutex, NULL);
+	pthread_mutex_init(&session_mutex, NULL);
 	da_init(filters);
 }
 
 void iso_filters_free(void)
 {
 	da_free(filters);
+	pthread_mutex_destroy(&session_mutex);
 	pthread_mutex_destroy(&filters_mutex);
 }
 
@@ -122,6 +135,22 @@ static bool is_usable_video_encoder(const char *id)
 
 	const char *codec = obs_get_encoder_codec(id);
 	return codec && (strcmp(codec, "hevc") == 0 || strcmp(codec, "h264") == 0 || strcmp(codec, "prores") == 0);
+}
+
+/* B-frames make fragmented files start their video a few frames after the
+ * timecode track while the file is growing (the offset disappears only when
+ * the file is finalised), so ISOs are always encoded without them. The
+ * setting's name and type differ per encoder. */
+static void disable_b_frames(const char *enc_id, obs_data_t *enc_settings)
+{
+	if (strstr(enc_id, "videotoolbox"))
+		obs_data_set_bool(enc_settings, "bframes", false);
+	else if (strstr(enc_id, "qsv"))
+		obs_data_set_int(enc_settings, "bframes", 0);
+	else if (strcmp(enc_id, "obs_x264") == 0)
+		obs_data_set_string(enc_settings, "x264opts", "bframes=0");
+	else
+		obs_data_set_int(enc_settings, "bf", 0); /* NVENC, AMF */
 }
 
 static void sanitize_filename(struct dstr *str)
@@ -223,6 +252,7 @@ static void session_release(struct iso_session *s)
 		obs_weak_source_release(s->parent);
 	}
 
+	dstr_free(&s->name);
 	bfree(s);
 }
 
@@ -231,38 +261,43 @@ static void session_release_task(void *param)
 	session_release(param);
 }
 
-static void output_stopped(void *data, calldata_t *cd);
-
-/* Disconnects the stop signal. Must NOT be called while holding f->mutex:
- * OBS runs signal callbacks with the signal's lock held, and output_stopped
- * takes f->mutex, so disconnecting under f->mutex could deadlock. */
-static void disconnect_session(struct iso_filter *f, struct iso_session *s)
+/* Detaches `f`'s current session, if any, and returns it. */
+static struct iso_session *detach_session(struct iso_filter *f)
 {
-	if (s && s->output)
-		signal_handler_disconnect(obs_output_get_signal_handler(s->output), "stop", output_stopped, f);
-}
-
-static void output_stopped(void *data, calldata_t *cd)
-{
-	struct iso_filter *f = data;
-	int code = (int)calldata_int(cd, "code");
-
-	pthread_mutex_lock(&f->mutex);
+	pthread_mutex_lock(&session_mutex);
 	struct iso_session *s = f->session;
 	if (s) {
-		/* Don't disconnect from inside the signal; just detach. */
 		f->session = NULL;
+		s->filter = NULL;
 	}
-	pthread_mutex_unlock(&f->mutex);
+	pthread_mutex_unlock(&session_mutex);
+	return s;
+}
 
-	if (!s)
-		return;
+/* "stop" signal of a session's output. Runs once per started output, on
+ * OBS's output thread. `data` is the session, never the filter, so this is
+ * safe even after the filter has been destroyed. */
+static void output_stopped(void *data, calldata_t *cd)
+{
+	struct iso_session *s = data;
+	int code = (int)calldata_int(cd, "code");
 
-	if (code != OBS_OUTPUT_SUCCESS)
-		warn("Recording stopped with error %d: %s", code,
-		     obs_output_get_last_error(s->output) ? obs_output_get_last_error(s->output) : "unknown");
-	else
-		info("Recording stopped");
+	/* Unexpected stop (e.g. write error): detach from the filter so it
+	 * shows as not recording. */
+	pthread_mutex_lock(&session_mutex);
+	if (s->filter) {
+		s->filter->session = NULL;
+		s->filter = NULL;
+	}
+	pthread_mutex_unlock(&session_mutex);
+
+	if (code != OBS_OUTPUT_SUCCESS) {
+		const char *err = obs_output_get_last_error(s->output);
+		blog(LOG_WARNING, "[iso-recorder: '%s'] Recording stopped with error %d: %s", s->name.array, code,
+		     err ? err : "unknown");
+	} else {
+		blog(LOG_INFO, "[iso-recorder: '%s'] Recording stopped", s->name.array);
+	}
 
 	obs_queue_task(OBS_TASK_DESTROY, session_release_task, s, false);
 }
@@ -276,7 +311,10 @@ static bool iso_filter_start(struct iso_filter *f)
 
 	pthread_mutex_lock(&f->mutex);
 
-	if (f->session) {
+	pthread_mutex_lock(&session_mutex);
+	bool running = f->session != NULL;
+	pthread_mutex_unlock(&session_mutex);
+	if (running) {
 		ok = true;
 		goto unlock;
 	}
@@ -294,7 +332,11 @@ static bool iso_filter_start(struct iso_filter *f)
 
 	uint32_t width = obs_source_get_width(parent);
 	uint32_t height = obs_source_get_height(parent);
-	width += width & 1;
+	/* OBS's raw frames come out sheared when the width is not a multiple of
+	 * 4 (seen at 1366 and 1370 wide with every encoder), so pad the view:
+	 * the source renders at native size with up to 3 px of black at the
+	 * right. Height only needs to be even for 4:2:0. */
+	width = (width + 3) & ~3u;
 	height += height & 1;
 	if (!width || !height) {
 		warn("Source has no video yet (0x0), not recording");
@@ -304,6 +346,7 @@ static bool iso_filter_start(struct iso_filter *f)
 	obs_data_t *settings = obs_source_get_settings(f->source);
 
 	struct iso_session *s = bzalloc(sizeof(struct iso_session));
+	dstr_copy(&s->name, obs_source_get_name(f->source));
 
 	/* View rendering just this source at its native size, on OBS's
 	 * main frame clock. */
@@ -343,6 +386,7 @@ static bool iso_filter_start(struct iso_filter *f)
 	obs_data_set_string(enc_settings, "rate_control", "CBR");
 	obs_data_set_int(enc_settings, "bitrate", obs_data_get_int(settings, S_BITRATE));
 	obs_data_set_int(enc_settings, "keyint_sec", obs_data_get_int(settings, S_KEYINT));
+	disable_b_frames(enc_id, enc_settings);
 
 	struct dstr enc_name = {0};
 	dstr_printf(&enc_name, "ISO video: %s", obs_source_get_name(parent));
@@ -397,16 +441,21 @@ static bool iso_filter_start(struct iso_filter *f)
 	if (s->aenc)
 		obs_output_set_audio_encoder(s->output, s->aenc, 0);
 
-	signal_handler_connect(obs_output_get_signal_handler(s->output), "stop", output_stopped, f);
+	/* Publish before starting: an output that fails right after starting
+	 * emits "stop", and output_stopped must find the session attached. */
+	signal_handler_connect(obs_output_get_signal_handler(s->output), "stop", output_stopped, s);
+	pthread_mutex_lock(&session_mutex);
+	s->filter = f;
 	f->session = s;
+	pthread_mutex_unlock(&session_mutex);
 
 	if (!obs_output_start(s->output)) {
-		/* A failed start does not emit "stop", so disconnecting here
-		 * cannot race with output_stopped. */
+		/* A failed start does not emit "stop", so the session is still
+		 * ours to release. */
 		const char *err = obs_output_get_last_error(s->output);
 		warn("Could not start recording: %s", err ? err : "unknown error");
-		f->session = NULL;
-		disconnect_session(f, s);
+		detach_session(f);
+		signal_handler_disconnect(obs_output_get_signal_handler(s->output), "stop", output_stopped, s);
 		goto fail;
 	}
 
@@ -427,11 +476,23 @@ unlock:
 static void iso_filter_stop(struct iso_filter *f)
 {
 	pthread_mutex_lock(&f->mutex);
-	obs_output_t *output = f->session ? obs_output_get_ref(f->session->output) : NULL;
+
+	/* Detach first, so the filter can start again immediately while the
+	 * old file is finalised. The session holds its own output reference
+	 * until output_stopped queues its release. */
+	pthread_mutex_lock(&session_mutex);
+	struct iso_session *s = f->session;
+	obs_output_t *output = s ? obs_output_get_ref(s->output) : NULL;
+	if (s) {
+		f->session = NULL;
+		s->filter = NULL;
+	}
+	pthread_mutex_unlock(&session_mutex);
+
 	pthread_mutex_unlock(&f->mutex);
 
 	if (output) {
-		/* Cleanup happens in output_stopped once the file is final. */
+		info("Stopping, finalising '%s'", obs_output_get_name(output));
 		obs_output_stop(output);
 		obs_output_release(output);
 	}
@@ -439,9 +500,9 @@ static void iso_filter_stop(struct iso_filter *f)
 
 static bool iso_filter_active(struct iso_filter *f)
 {
-	pthread_mutex_lock(&f->mutex);
+	pthread_mutex_lock(&session_mutex);
 	bool active = f->session != NULL;
-	pthread_mutex_unlock(&f->mutex);
+	pthread_mutex_unlock(&session_mutex);
 	return active;
 }
 
@@ -519,18 +580,10 @@ static void iso_filter_destroy(void *data)
 	da_erase_item(filters, &f);
 	pthread_mutex_unlock(&filters_mutex);
 
-	pthread_mutex_lock(&f->mutex);
-	struct iso_session *s = f->session;
-	f->session = NULL;
-	pthread_mutex_unlock(&f->mutex);
-
-	if (s) {
-		/* Filter removed while recording. Disconnecting also waits for
-		 * any in-flight stop callback, so `f` is safe to free after. */
-		disconnect_session(f, s);
-		obs_output_force_stop(s->output);
-		session_release(s);
-	}
+	/* Filter removed while recording: stop like a normal stop. The file is
+	 * finalised and the session released by output_stopped, which never
+	 * touches the filter once detached. */
+	iso_filter_stop(f);
 
 	dstr_free(&f->last_path);
 	pthread_mutex_destroy(&f->mutex);
@@ -576,7 +629,6 @@ static bool stop_clicked(obs_properties_t *props, obs_property_t *property, void
 
 static obs_properties_t *iso_filter_properties(void *data)
 {
-	UNUSED_PARAMETER(data);
 	obs_properties_t *props = obs_properties_create();
 
 	obs_properties_add_path(props, S_FOLDER, obs_module_text("Folder"), OBS_PATH_DIRECTORY, NULL, NULL);
@@ -612,8 +664,8 @@ static obs_properties_t *iso_filter_properties(void *data)
 	obs_property_int_set_suffix(p, " ms");
 	obs_property_set_long_description(p, obs_module_text("MinFragment.Description"));
 
-	obs_properties_add_button(props, "start", obs_module_text("Start"), start_clicked);
-	obs_properties_add_button(props, "stop", obs_module_text("Stop"), stop_clicked);
+	obs_properties_add_button2(props, "start", obs_module_text("Start"), start_clicked, data);
+	obs_properties_add_button2(props, "stop", obs_module_text("Stop"), stop_clicked, data);
 
 	return props;
 }
