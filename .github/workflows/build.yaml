@@ -1,0 +1,69 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake --preset windows-ci-x64
+
+      - name: Build
+        run: cmake --build --preset windows-ci-x64
+
+      - name: Install
+        run: cmake --install build_x64 --prefix release --config RelWithDebInfo
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obs-iso-recorder-windows-x64
+          path: release/**
+
+  macos:
+    name: macOS Universal
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake --preset macos-ci
+
+      - name: Build
+        run: cmake --build --preset macos-ci
+
+      - name: Install and package
+        run: cmake --install build_macos --prefix release --config RelWithDebInfo
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obs-iso-recorder-macos
+          path: |
+            release/*.plugin
+            release/*.pkg
+
+  timecode-tests:
+    name: Timecode unit tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # timecode.c only needs three libobs utility headers; stub them so the
+      # tests run without building libobs.
+      - name: Build and run
+        run: |
+          mkdir -p shim/util
+          printf '#pragma once\n#include <stdint.h>\n#include <time.h>\nstatic inline uint64_t os_gettime_ns(void){struct timespec t;clock_gettime(CLOCK_UPTIME_RAW,&t);return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec;}\n' > shim/util/platform.h
+          printf '#pragma once\n#include <pthread.h>\n' > shim/util/threading.h
+          printf '#pragma once\n#include <stdint.h>\nstatic inline uint64_t util_mul_div64(uint64_t n,uint64_t m,uint64_t d){return (uint64_t)(((unsigned __int128)n*m)/d);}\n' > shim/util/util_uint64.h
+          clang -std=c11 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -Ishim -Isrc \
+            tests/timecode-test.c src/timecode.c -o timecode-test
+          ./timecode-test
