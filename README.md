@@ -1,88 +1,108 @@
 # ISO Recorder for OBS
 
-Records each camera source in OBS as its own **growing MOV with time-of-day timecode**, so DaVinci Resolve (including Resolve Replay) can edit the ISOs while they are still recording, with every angle already in sync.
+Records each camera in OBS to its own growing MOV with time-of-day timecode. Resolve (including Replay) can edit the ISOs while they record, with every angle already in sync.
 
-Built for a Windows laptop running OBS with a DeckLink, recording to a Blackmagic Cloud Store, with Resolve on a Mac reading the files over the network.
+Built for: Windows laptop, OBS, DeckLink, recording to a Blackmagic Cloud Store. Resolve on a Mac reads the files over the network.
 
 ## What it does
 
-- **ISO Record filter.** Add it to any source (e.g. a DeckLink input). While recording, that source is rendered at its native resolution into its own OBS view, encoded with its own encoder (NVENC HEVC by default) and written to its own file.
-- **Growing files.** Files are written as fragmented QuickTime (OBS's Hybrid MOV writer), so Resolve picks up new footage every fragment (one per keyframe interval, 1 s by default). When recording stops, the file is finalised as a normal MOV.
-- **Time-of-day timecode.** A QuickTime timecode (`tmcd`) track is written into the file header and first fragment, so the timecode is readable **while the file grows**. At 59.94/29.97 it uses drop-frame.
-- **Shared clock.** All ISOs recording at the same time share one anchor, so the same frame gets the same timecode in every file, even if cameras start at different moments.
-- **One control.** Tools → *ISO Recorder: Start/Stop all ISOs*, a hotkey pair for the same, and (per filter, on by default) start/stop together with OBS's own Record button.
+- **ISO Record filter.** Add to any source. Records that source at native resolution, with its own encoder, to its own file.
+- **Growing files.** New footage shows up in Resolve every keyframe interval (1 s default). File becomes a normal MOV when recording stops.
+- **Time-of-day timecode.** Readable while the file grows. Drop-frame at 29.97 and 59.94.
+- **Shared clock.** Same frame, same timecode, in every file. Cameras can start at different times.
+- **One control.** OBS Record button, Tools menu, or hotkeys. Stop returns right away. Files finish writing in the background, so the next take can start immediately.
 
-## Using it
+## Use it
 
-1. Install the plugin (see *Building*), restart OBS.
-2. On each camera source: **Filters → + → ISO Record**.
-3. Set the recording folder (blank = OBS's recording path; use the Cloud Store share), encoder, bitrate and audio mix track.
-4. Press **Record** in OBS (or Tools → *Start all ISOs*).
-5. In Resolve, import the growing files from the share. They grow in the viewer/timeline and carry synced time-of-day timecode for Replay and multicam.
+1. Install the plugin (see Build). Restart OBS.
+2. On each camera source: Filters > + > ISO Record.
+3. Set recording folder to the Cloud Store share. Blank uses OBS's recording path.
+4. Set encoder, bitrate, audio mix track.
+5. Press Record in OBS. Or Tools > ISO Recorder: Start all ISOs.
+6. In Resolve, import the growing files from the share.
 
-Files are named `<Source name> <date> <time>.mov` and never overwrite an existing file (Resolve caches media by name).
+## Settings
 
-### Recommended settings
+| Setting | Value |
+|---|---|
+| Encoder | NVIDIA NVENC HEVC |
+| Bitrate | 50 to 80 Mbps |
+| Keyframe interval | 1 s (how often Resolve sees new footage) |
+| Min fragment length | 0. ProRes: 1000 ms |
+| Drop-frame | On |
 
-| Setting | Value | Why |
-|---|---|---|
-| Encoder | NVIDIA NVENC HEVC | hardware encode, low CPU |
-| Bitrate | 50–80 Mbps | replay/slow-mo quality |
-| Keyframe interval | 1 s | = fragment length = how often Resolve sees new footage |
-| Min fragment length | 0 (or 1000 ms for ProRes) | ProRes is all-keyframe; 1000 ms keeps fragments ~1 s |
-| Drop-frame | on | standard for 59.94 |
+## Rules
 
-**Watch OBS's "frames missed due to rendering lag".** If OBS drops frames, the ISO's timeline gets shorter than real time and later frames' timecode drifts from the other angles. It must stay at (or very near) zero on the recording laptop.
+- **Keep "frames missed due to rendering lag" at 0.** Dropped frames shorten the ISO and push its timecode off the other angles.
+- Files are named `<Source> <date> <time>.mov`. Never overwritten.
+- ISOs record without B-frames. With B-frames, growing files sit 2 frames off their timecode.
+- Widths not divisible by 4 (for example 1366) get up to 3 px of black on the right. OBS scrambles those widths otherwise. 720p, 1080p and 4K are unaffected.
 
-## How the timecode is computed
+## How timecode works
 
-- The first video packet an output receives is a keyframe, and OBS sets its `sys_dts_usec` to the capture time of that frame (`os_gettime_ns` clock). That marks media time zero.
-- The first ISO of a session converts that time to local time of day and stores it as the start frame.
-- Every later ISO counts whole OBS frame intervals from that anchor (exact, since all OBS mixes render on the same frame clock).
-- The anchor resets when no ISO is recording, so each session re-syncs to the wall clock.
+- First video frame of a file: OBS capture time, converted to time of day.
+- First ISO of a session sets the anchor. Later ISOs count OBS frames from it, so every file agrees to the frame.
+- Anchor resets when nothing is recording. Each session re-syncs to the clock.
+- The timecode track layout matches what FFmpeg writes.
 
-The `tmcd` layout (60-frame counting for 59.94 DF, `tref` from the video track, track flagged "in movie") matches what FFmpeg writes, which was verified to be read correctly by DaVinci Resolve 21.1 while the file is growing.
+## Build
 
-## Code layout
+Based on the official OBS plugin template. Targets OBS 31.1.1, loads in OBS 32.
+
+**Windows and macOS release builds.** Push to GitHub. `.github/workflows/build.yaml` builds Windows x64 and a macOS `.pkg`. Download from the workflow run's artifacts.
+
+**Mac quick build (no Xcode).** Quit OBS, then:
+
+```sh
+tests/mac/build-local.sh --install
+```
+
+Builds against the OBS in `/Applications` and installs to `~/Library/Application Support/obs-studio/plugins`. Apple Silicon only, that OBS version only. First run downloads OBS headers into `build_local/deps`.
+
+**Mac end-to-end test.** Needs FFmpeg.
+
+```sh
+tests/mac/e2e.sh
+```
+
+Records test cameras headless and checks:
+
+- timecode in growing and finished files
+- frame-accurate sync between ISOs started at different times
+- Stop then immediate Record
+- removing a filter mid-recording
+- odd widths
+- clean shutdown with no leaks
+
+**Linux.** `tests/headless-record.c` and `tests/timecode-test.c`. See the comments at the top of each file.
+
+## Code
 
 | Path | What |
 |---|---|
-| `src/plugin-main.c` | module load, Tools menu, hotkeys, follow-Record events, global procs |
-| `src/iso-filter.c` | the ISO Record filter: view, encoders, output lifecycle |
-| `src/iso-output.c` | `iso_mov_output`: trimmed copy of OBS's Hybrid MOV output + timecode |
-| `src/timecode.c` | drop-frame maths, wall-clock mapping, shared session clock |
-| `src/mux/` | OBS 32.2.2's MP4/MOV muxer (GPL-2.0+) with the timecode track and fragment-interval additions (search for "ISO Recorder") |
-| `tests/timecode-test.c` | unit tests (label maths over a full day, shared clock) |
-| `tests/headless-record.c` | Linux end-to-end test: headless libobs, two test cameras |
-| `tests/inspect_mov.py` | prints layout, tracks and start timecode of a growing or finished file |
-
-## Building
-
-Uses the official OBS plugin template (targets OBS 31.1.1; also loads in OBS 32).
-
-- **Windows / macOS:** push to GitHub; the included GitHub Actions workflows build and package for Windows x64 and macOS. Or locally: `cmake --preset windows-x64` then `cmake --build --preset windows-x64` (Visual Studio 2022), `cmake --preset macos` (Xcode).
-- **Linux (tests):** `cmake --preset ubuntu-x86_64 -DENABLE_TESTS=ON && cmake --build build_x86_64 && ./build_x86_64/timecode-test`
-
-The headless test needs `libobs-dev`, `obs-studio`, Xvfb and FFmpeg:
-
-```sh
-Xvfb :99 &
-gcc -o build_x86_64/headless-record tests/headless-record.c -I/usr/include/obs -lobs -lX11
-DISPLAY=:99 ./build_x86_64/headless-record build_x86_64/obs-iso-recorder.so data /tmp/iso 20 640 360
-python3 tests/inspect_mov.py /tmp/iso/*.mov
-```
+| `src/plugin-main.c` | Plugin load, Tools menu, hotkeys, Record button events |
+| `src/iso-filter.c` | ISO Record filter: view, encoders, start and stop |
+| `src/iso-output.c` | MOV output with timecode (trimmed copy of OBS's Hybrid MOV output) |
+| `src/timecode.c` | Drop-frame math, wall clock, shared session clock |
+| `src/mux/` | OBS's MP4/MOV muxer plus the timecode track. Changes marked "ISO Recorder" |
+| `tests/` | Unit tests, end-to-end tests, `inspect_mov.py` for checking files |
 
 ## Status (v0.1.0)
 
-Tested on Linux with headless OBS 30.2 (x264, two test-pattern cameras, 59.94 DF):
+Tested:
 
-- growing files carry the timecode track from the first fragment; ffprobe reads it mid-recording
-- one fragment per second with a 1 s keyframe interval; clean finalisation; no leaks
-- ISOs started one frame apart get timecodes exactly one frame apart
-- DaVinci Resolve 21.1 (macOS): the plugin's growing bytes, replayed in real time, grew live with the correct start timecode; the finished file imported with correct timecode, drop-frame flag, frame count and audio
+- Mac, OBS 32.2.1 and 32.2.2, VideoToolbox HEVC. End-to-end test passes. Real OBS session recorded 1080p60 with correct timecode.
+- Linux, headless OBS 30.2, x264.
+- Resolve 21.1 on Mac read growing and finished files with correct timecode (earlier testing, before B-frames were turned off).
 
-Not yet tested: Windows build, NVENC, DeckLink sources, Cloud Store over SMB, multi-hour soak.
+Not tested yet:
+
+- Windows build
+- NVENC
+- DeckLink
+- Cloud Store over the network
+- Multi-hour recordings
 
 ## License
 
-GPL-2.0-or-later. `src/mux/` is derived from OBS Studio (Copyright (C) 2024 Dennis Sädtler).
+GPL-2.0-or-later. `src/mux/` is from OBS Studio (Copyright (C) 2024 Dennis Sädtler).
