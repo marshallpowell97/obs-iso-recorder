@@ -41,6 +41,7 @@ target_sources(
     src/iso-filter.c
     src/iso-output.c
     src/iso-output.h
+    src/compat/buffered-file-serializer.h
     src/timecode.c
     src/timecode.h
     src/mux/mp4-mux.c

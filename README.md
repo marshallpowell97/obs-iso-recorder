@@ -47,7 +47,7 @@ Built for: Windows laptop, OBS, DeckLink, recording to a Blackmagic Cloud Store.
 
 ## Build
 
-Based on the official OBS plugin template. Built against OBS 32.2.2. Needs OBS 32 or newer.
+Based on the official OBS plugin template. Built against OBS 31.1.1. Loads in OBS 31 and newer.
 
 **Windows and macOS release builds.** Push to GitHub. `.github/workflows/build.yaml` builds Windows x64 and a macOS `.pkg`. Download from the workflow run's artifacts.
 

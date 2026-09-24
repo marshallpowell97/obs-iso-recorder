@@ -26,7 +26,7 @@
 #include <util/platform.h>
 #include <util/dstr.h>
 #include <util/threading.h>
-#include <util/buffered-file-serializer.h>
+#include "compat/buffered-file-serializer.h"
 
 #define do_log(level, format, ...) \
 	blog(level, "[iso-recorder output: '%s'] " format, obs_output_get_name(out->output), ##__VA_ARGS__)
